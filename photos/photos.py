@@ -173,7 +173,7 @@ def watermark_photo(image, settings):
         mark_image = Image.open(settings['PHOTO_WATERMARK_IMG'])
         mark_image_size = [watermark_layer.size[0] // image_reducer for size in mark_size]
         mark_image_size = settings['PHOTO_WATERMARK_IMG_SIZE'] if settings['PHOTO_WATERMARK_IMG_SIZE'] else mark_image_size
-        mark_image.thumbnail(mark_image_size, Image.ANTIALIAS)
+        mark_image.thumbnail(mark_image_size, Image.BICUBIC)
         mark_position = [watermark_layer.size[i] - mark_image.size[i] - margin[i] for i in [0, 1]]
         mark_position = tuple([mark_position[0] - (text_size[0] // 2) + (mark_image_size[0] // 2), mark_position[1] - text_size[1]])
 
@@ -187,25 +187,53 @@ def watermark_photo(image, settings):
 
     return image
 
+def will_rotate(img, settings):
+    if settings['PHOTO_EXIF_AUTOROTATE']:
+        try:
+            exif = piexif.load(img.info['exif'])
+            if "exif" in img.info and piexif.ImageIFD.Orientation in exif["0th"]:
+                orientation = exif["0th"].get(piexif.ImageIFD.Orientation)
+                if orientation == 2:
+                    return False
+                elif orientation == 3:
+                    return False
+                elif orientation == 4:
+                    return False
+                elif orientation == 5:
+                    return True
+                elif orientation == 6:
+                    return True
+                elif orientation == 7:
+                    return True
+                elif orientation == 8:
+                    return True
+            else:
+                return False
+
+        except Exception:
+            logger.debug('EXIF information not found')
+            return False
+    else:
+        return False
+
 
 def rotate_image(img, exif_dict):
-
     if "exif" in img.info and piexif.ImageIFD.Orientation in exif_dict["0th"]:
-        orientation = exif_dict["0th"].pop(piexif.ImageIFD.Orientation)
+        orientation = exif_dict["0th"].get(piexif.ImageIFD.Orientation)
         if orientation == 2:
             img = img.transpose(Image.FLIP_LEFT_RIGHT)
         elif orientation == 3:
-            img = img.rotate(180)
+            img = img.rotate(180, expand=True)
         elif orientation == 4:
-            img = img.rotate(180).transpose(Image.FLIP_LEFT_RIGHT)
+            img = img.rotate(180, expand=True).transpose(Image.FLIP_LEFT_RIGHT)
         elif orientation == 5:
-            img = img.rotate(-90).transpose(Image.FLIP_LEFT_RIGHT)
+            img = img.rotate(-90, expand=True).transpose(Image.FLIP_LEFT_RIGHT)
         elif orientation == 6:
-            img = img.rotate(-90)
+            img = img.rotate(-90, expand=True)
         elif orientation == 7:
-            img = img.rotate(90).transpose(Image.FLIP_LEFT_RIGHT)
+            img = img.rotate(90, expand=True).transpose(Image.FLIP_LEFT_RIGHT)
         elif orientation == 8:
-            img = img.rotate(90)
+            img = img.rotate(90, expand=True)
 
     return (img, exif_dict)
 
@@ -250,7 +278,11 @@ def manipulate_exif(img, settings):
             license = build_license(settings['PHOTO_EXIF_COPYRIGHT'], author)
             exif['0th'][piexif.ImageIFD.Copyright] = license
 
-    return (img, piexif.dump(exif))
+    try:
+        exifdata = piexif.dump(exif)
+    except Exception as e:
+        logger.debug("caught exception {}".format(e))
+    return (img, img.info['exif'])
 
 
 def resize_worker(orig, resized, spec, settings):
@@ -258,13 +290,15 @@ def resize_worker(orig, resized, spec, settings):
     logger.info('photos: make photo {} -> {}'.format(orig, resized))
     im = Image.open(orig)
 
-    if ispiexif and settings['PHOTO_EXIF_KEEP'] and im.format == 'JPEG':  # Only works with JPEG exif for sure.
+    valid_format = (im.format == 'JPEG') or (im.format == 'MPO')
+
+    if ispiexif and settings['PHOTO_EXIF_KEEP']:  # Only works with JPEG exif for sure.
         im, exif_copy = manipulate_exif(im, settings)
     else:
         exif_copy = b''
 
     icc_profile = im.info.get("icc_profile", None)
-    im.thumbnail((spec[0], spec[1]), Image.ANTIALIAS)
+    im.thumbnail((spec[0], spec[1]), Image.BICUBIC)
     directory = os.path.split(resized)[0]
 
     if isalpha(im):
@@ -328,7 +362,7 @@ def detect_content(content):
             )
 
             if os.path.isfile(path):
-                photo_prefix = os.path.splitext(value)[0].lower()
+                photo_prefix = os.path.splitext(value)[0]
 
                 if what == 'photo':
                     photo_article = photo_prefix + 'a.jpg'
@@ -470,8 +504,9 @@ def process_gallery(generator, content, location):
 
         if os.path.isdir(dir_gallery):
             logger.info('photos: Gallery detected: {}'.format(rel_gallery))
-            dir_photo = os.path.join('photos', rel_gallery.lower())
-            dir_thumb = os.path.join('photos', rel_gallery.lower())
+            dir_photo = os.path.join('photos', rel_gallery)
+            dir_photo_src = os.path.join(os.path.expanduser(generator.settings['PHOTO_LIBRARY']), rel_gallery)
+            dir_thumb = os.path.join('photos', rel_gallery)
             exifs = read_notes(os.path.join(dir_gallery, 'exif.txt'),
                                msg='photos: No EXIF for gallery')
             captions = read_notes(os.path.join(dir_gallery, 'captions.txt'), msg='photos: No captions for gallery')
@@ -486,14 +521,46 @@ def process_gallery(generator, content, location):
                     continue
                 if pic in blacklist:
                     continue
-                photo = os.path.splitext(pic)[0].lower() + '.jpg'
-                thumb = os.path.splitext(pic)[0].lower() + 't.jpg'
+                picsplit = os.path.splitext(pic)
+                photo = pic
+                thumb = picsplit[0] + 't' + picsplit[1]
+
+                # photo = os.path.splitext(pic)[0].lower() + '.jpg'
+                # thumb = os.path.splitext(pic)[0].lower() + 't.jpg'
+
+                # calculating the resulting image dimensions
+                filename = os.path.join(dir_photo_src, pic)
+                max_width, max_height, quality = generator.settings['PHOTO_GALLERY']
+                width = max_width
+                height = max_height
+
+                with Image.open(filename) as im:
+                    src_width, src_height = im.size
+                    if src_width > max_width:
+                        width = max_width
+                        height = int(float(src_height) * (float(max_width)/float(src_width)))
+                    else:
+                        width = src_width
+
+                    if height > max_height:
+                        height = max_height
+                        width = int(float(src_width) * (float(max_height)/float(src_height)))
+                    else:
+                        height = src_height
+
+                # swap height and width if the image is to be rotated
+                img = Image.open(filename)
+                if will_rotate(img, generator.settings):
+                    width, height = height, width
+
                 content_gallery.append((
                     pic,
                     os.path.join(dir_photo, photo),
                     os.path.join(dir_thumb, thumb),
                     exifs.get(pic, ''),
-                    captions.get(pic, '')))
+                    captions.get(pic, ''),
+                    width,
+                    height))
 
                 enqueue_resize(
                     os.path.join(dir_gallery, pic),
@@ -538,12 +605,18 @@ def process_image(generator, content, image):
         image = file_clipper(image)
 
     if os.path.isfile(path):
-        photo = os.path.splitext(image)[0].lower() + 'a.jpg'
-        thumb = os.path.splitext(image)[0].lower() + 't.jpg'
+        imagesplit = os.path.splitext(image)
+        photo = imagesplit[0] + 'a' + imagesplit[1]
+        thumb = imagesplit[0] + 't' + imagesplit[1]
+
+        pre = generator.settings['SITEURL']
+        if pre == '':
+            pre = '/'
+
         content.photo_image = (
-            os.path.basename(image).lower(),
-            os.path.join('photos', photo),
-            os.path.join('photos', thumb))
+            os.path.basename(image),
+            os.path.join(pre, 'photos', photo),
+            os.path.join(pre, 'photos', thumb))
         enqueue_resize(
             path,
             os.path.join('photos', photo),
