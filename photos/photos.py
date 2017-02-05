@@ -371,7 +371,7 @@ def detect_content(content):
                     photo_article = photo_prefix + 'a.jpg'
                     enqueue_resize(
                         path,
-                        os.path.join(pre, 'photos', photo_article),
+                        os.path.join('photos', photo_article),
                         settings['PHOTO_ARTICLE']
                     )
 
